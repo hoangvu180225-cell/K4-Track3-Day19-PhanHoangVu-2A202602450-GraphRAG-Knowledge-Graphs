@@ -34,6 +34,25 @@ from .store import EmbeddingStore
 # Canonical substance names: the ones BLHS Chương XX lists, plus common ones in Vietnamese news.
 SUBSTANCES = ["Heroine", "Cocaine", "Methamphetamine", "Amphetamine", "MDMA", "XLR-11", "Ketamine",
               "cần sa", "thuốc phiện", "côca"]
+
+SUBSTANCE_SYNONYMS = {
+    "thuốc lắc": "MDMA",
+    "kẹo": "MDMA",
+    "ecstasy": "MDMA",
+    "ma túy đá": "Methamphetamine",
+    "hàng đá": "Methamphetamine",
+    "đá": "Methamphetamine",
+    "ice": "Methamphetamine",
+    "ke": "Ketamine",
+    "bạch phiến": "Heroine",
+    "cỏ mỹ": "cần sa",
+    "cần": "cần sa",
+}
+
+def normalize_substance(name: str) -> str:
+    cleaned = re.sub(r"\s+", " ", name.strip().lower())
+    return SUBSTANCE_SYNONYMS.get(cleaned, name.strip())
+
 CLAUSE_START = re.compile(r"^(\d+)\.\s", re.MULTILINE)
 FOOTNOTE = re.compile(r"\[\d+\]")
 
@@ -76,7 +95,11 @@ def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = n
 
 def find_substances(text: str) -> list[str]:
     lowered = text.lower()
-    return [name for name in SUBSTANCES if name.lower() in lowered]
+    found = {name for name in SUBSTANCES if name.lower() in lowered}
+    for syn, canonical in SUBSTANCE_SYNONYMS.items():
+        if re.search(r"\b" + re.escape(syn) + r"\b", lowered):
+            found.add(canonical)
+    return list(found)
 
 # ----------------------------------------------------------------------------------------------
 # HINT — suggested ontology: extraction helpers
@@ -101,6 +124,17 @@ def parse_law_article(doc: Document) -> dict[str, Any]:
             "text": text,
             "substances": find_substances(text),
         })
+
+    max_clause_id = None
+    if clauses:
+        for cl in reversed(clauses):
+            pen = cl.get("penalty", "").lower()
+            if "tử hình" in pen or "chung thân" in pen or "20 năm" in pen:
+                max_clause_id = cl["id"]
+                break
+        if not max_clause_id:
+            max_clause_id = clauses[-1]["id"]
+
     return {
         "id": article_id,
         "law": doc.metadata.get("law", ""),
@@ -108,6 +142,7 @@ def parse_law_article(doc: Document) -> dict[str, Any]:
         "doc_id": doc.id,
         "crime": normalize_crime(title) if title.startswith("Tội ") else None,
         "clauses": clauses,
+        "max_clause_id": max_clause_id,
     }
 
 NEWS_EXTRACTION_PROMPT = """Bạn trích xuất knowledge graph từ một bài báo tiếng Việt về ma túy.
@@ -216,8 +251,6 @@ class Neo4jGraph:
                          f"({e['b_label']}: {e['b_name']})")
         return seed_ids, facts
 
-    # ---------------------------------------------------------------- HINT — suggested ontology: writes
-
     def suggested_constraints(self) -> None:
         for label, key in [("Article", "id"), ("Clause", "id"), ("Crime", "name"), ("Case", "name"),
                            ("Substance", "name"), ("Person", "name"), ("Location", "name")]:
@@ -232,14 +265,26 @@ class Neo4jGraph:
             WITH a
             UNWIND $clauses AS clause
             MERGE (cl:Clause {id: clause.id})
-              SET cl.number = clause.number, cl.penalty = clause.penalty, cl.text = clause.text, cl.doc_id = $doc_id
+              SET cl.number = clause.number, cl.penalty = clause.penalty, cl.text = clause.text, cl.doc_id = $doc_id,
+                  cl.is_max_penalty = (clause.id = $max_clause_id)
             MERGE (a)-[:HAS_CLAUSE]->(cl)
+            FOREACH (_ IN CASE WHEN clause.id = $max_clause_id THEN [1] ELSE [] END |
+                MERGE (a)-[:HAS_MAX_CLAUSE]->(cl))
             FOREACH (s IN clause.substances | MERGE (sub:Substance {name: s}) MERGE (cl)-[:MENTIONS]->(sub))
             """,
             **article,
         )
 
     def add_news_case(self, case: dict, doc: Document) -> None:
+        raw_subs = case.get("substances", [])
+        norm_subs = []
+        for s in raw_subs:
+            if s.get("name"):
+                norm_subs.append({
+                    "name": normalize_substance(s["name"]),
+                    "raw_name": s["name"],
+                    "amount": s.get("amount", ""),
+                })
         self.run(
             """
             MERGE (k:Case {name: $name})
@@ -247,7 +292,10 @@ class Neo4jGraph:
             FOREACH (loc IN CASE WHEN $location = '' THEN [] ELSE [$location] END |
                 MERGE (l:Location {name: loc}) MERGE (k)-[:LOCATED_IN]->(l))
             FOREACH (crime IN $charges | MERGE (c:Crime {name: crime}) MERGE (k)-[:CHARGED_WITH]->(c))
-            FOREACH (s IN $substances | MERGE (sub:Substance {name: s.name}) MERGE (k)-[r:INVOLVES]->(sub)
+            FOREACH (s IN $substances | 
+                MERGE (sub:Substance {name: s.name}) 
+                SET sub.aliases = CASE WHEN s.raw_name <> s.name THEN [s.raw_name] ELSE [] END
+                MERGE (k)-[r:INVOLVES]->(sub)
                 SET r.amount = s.amount)
             FOREACH (p IN $people | MERGE (person:Person {name: p.name})
                 SET person.aliases = coalesce(p.aliases, [])
@@ -256,7 +304,7 @@ class Neo4jGraph:
             name=case.get("name") or doc.metadata.get("title", doc.id),
             summary=case.get("summary", ""), date=case.get("date", ""), location=case.get("location", ""),
             charges=case.get("charges", []), people=[p for p in case.get("people", []) if p.get("name")],
-            substances=[s for s in case.get("substances", []) if s.get("name")],
+            substances=norm_subs,
             doc_id=doc.id, title=doc.metadata.get("title", ""),
         )
 
@@ -280,21 +328,25 @@ class Neo4jGraph:
             if c.get("summary"):
                 facts.append(f"Vụ việc '{c['name']}': {c['summary']}")
 
-        # 2. Multi-hop from cases: (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        # Keep clause 1 + clauses that MENTION a Substance the case INVOLVES
+        # 2. Multi-hop from cases: (Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
+        # Keep clause 1 + max penalty clause (HAS_MAX_CLAUSE) + clauses that MENTION a Substance the case INVOLVES
         if case_ids:
             clauses = self.run(
                 """
                 MATCH (k:Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
                 WHERE elementId(k) IN $case_ids
-                  AND (cl.number = 1 OR EXISTS { MATCH (k)-[:INVOLVES]->(:Substance)<-[:MENTIONS]-(cl) })
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                  AND (cl.number = 1 
+                       OR cl.is_max_penalty = true 
+                       OR EXISTS { (a)-[:HAS_MAX_CLAUSE]->(cl) }
+                       OR EXISTS { MATCH (k)-[:INVOLVES]->(:Substance)<-[:MENTIONS]-(cl) })
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text, cl.is_max_penalty AS is_max
                 ORDER BY a.id, cl.number
                 """,
                 case_ids=case_ids,
             )
             for row in clauses:
-                facts.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+                tag = " (khung cao nhất)" if row.get("is_max") and row["number"] > 1 else ""
+                facts.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}{tag}: {row['text']}")
 
         # 3. Articles named in question (e.g. "Điều 251")
         article_numbers = re.findall(r"[Đđ]iều\s*(\d+)", question)
@@ -304,18 +356,22 @@ class Neo4jGraph:
                 """
                 MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
                 WHERE a.id CONTAINS $num
-                  AND (cl.number = 1 OR (size($subs) > 0 AND EXISTS {
-                      MATCH (cl)-[:MENTIONS]->(sub:Substance)
-                      WHERE toLower(sub.name) IN $subs
-                  }))
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                  AND (cl.number = 1 
+                       OR cl.is_max_penalty = true
+                       OR EXISTS { (a)-[:HAS_MAX_CLAUSE]->(cl) }
+                       OR (size($subs) > 0 AND EXISTS {
+                           MATCH (cl)-[:MENTIONS]->(sub:Substance)
+                           WHERE toLower(sub.name) IN $subs
+                       }))
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text, cl.is_max_penalty AS is_max
                 ORDER BY cl.number
                 """,
                 num=num,
                 subs=substances_in_q,
             )
             for row in law_clauses:
-                fact_str = f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}"
+                tag = " (khung cao nhất)" if row.get("is_max") and row["number"] > 1 else ""
+                fact_str = f"[{row['article_id']} - {row['title']}] khoản {row['number']}{tag}: {row['text']}"
                 if fact_str not in facts:
                     facts.append(fact_str)
 
